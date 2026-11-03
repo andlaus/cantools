@@ -4322,6 +4322,23 @@ BA_DEF_ BO_ "VFrameFormat" ENUM "StandardCAN","ExtendedCAN","J1939PG";
 
             self.assertEqual(str(cm.exception), expected_overlpping)
 
+    def test_overlapping_signals_encode_decode(self):
+        for byte_order, starts, expected in [
+                ('big_endian', (0, 4, 7), {'A': 0xe6, 'B': 0x5e, 'C': 0xabcd}),
+                ('little_endian', (0, 4, 0), {'A': 0xab, 'B': 0xda, 'C': 0xcdab})]:
+            signals = [
+                cantools.database.can.Signal(name, start, length,
+                                             byte_order=byte_order)
+                for name, start, length in zip('ABC', starts, (8, 8, 16), strict=True)
+            ]
+            message = cantools.database.can.Message(1, 'M', 2, signals,
+                                                    strict=False)
+
+            self.assertEqual(message.decode(b'\xab\xcd'), expected)
+
+            # consistent overlapping values round trip
+            self.assertEqual(message.encode(expected), b'\xab\xcd')
+
     def test_strict_load(self):
         filenames = [
             'tests/files/kcd/bad_message_length.kcd',

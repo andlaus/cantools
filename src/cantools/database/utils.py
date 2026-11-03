@@ -202,32 +202,79 @@ def create_encode_decode_formats(signals: Sequence[Union["Data", "Signal"]], num
         else:
             return 'u'
 
-    def padding_item(length: int) -> tuple[str, str, None]:
-        fmt = f'p{length}'
-        padding_mask = '1' * length
+    # items are (format, signed bit length, signal name or None); negative
+    # padding steps backwards which allows overlapping signals.
+    def padding_item(length: int) -> tuple[str, int, None]:
+        return f'p{length}', length, None
 
-        return fmt, padding_mask, None
-
-    def data_item(signal: Union["Data", "Signal"]) -> tuple[str, str, str]:
+    def data_item(signal: Union["Data", "Signal"]) -> tuple[str, int, str]:
         fmt = f'{get_format_string_type(signal)}{signal.length}'
-        padding_mask = '0' * signal.length
 
-        return fmt, padding_mask, signal.name
+        return fmt, signal.length, signal.name
 
-    def fmt(items: list[tuple[str, str, str | None]]) -> str:
+    def fmt(items: list[tuple[str, int, str | None]]) -> str:
         return ''.join([item[0] for item in items])
 
-    def names(items:  list[tuple[str, str, str | None]]) -> list[str]:
+    def names(items: list[tuple[str, int, str | None]]) -> list[str]:
         return [item[2] for item in items if item[2] is not None]
 
-    def padding_mask(items: list[tuple[str, str, str | None]]) -> int:
+    def padding_mask(items: list[tuple[str, int, str | None]]) -> int:
+        # bits not covered by any signal are 1
+        bits = [True] * format_length
+        cursor = 0
+
+        for _, length, name in items:
+            if name is not None:
+                for i in range(max(cursor, 0), min(cursor + length, format_length)):
+                    bits[i] = False
+
+            cursor += length
+
         try:
-            return int(''.join([item[1] for item in items]), 2)
+            return int(''.join('1' if bit else '0' for bit in bits), 2)
         except ValueError:
             return 0
 
+    def create_overlapping(placed: list[tuple[int, Union["Data", "Signal"]]]
+                           ) -> list[tuple[str, int, str | None]] | None:
+        """Create items for signals at the given bit positions of the
+        format if they overlap, else None.
+
+        Padding after written data would zero it, so the format is
+        zero filled first and then only moved backwards using
+        negative padding while visiting the signals from the highest
+        to the lowest position.
+
+        """
+        ordered = sorted(placed, key=lambda x: x[0])
+        end = 0
+
+        for pos, signal in ordered:
+            if pos < 0:
+                return None  # does not fit, reported by the strict check
+
+            if pos < end:
+                break
+
+            end = pos + signal.length
+        else:
+            return None
+
+        items: list[tuple[str, int, str | None]] = [
+            padding_item(format_length), padding_item(-format_length)]
+        cursor = 0
+
+        for pos, signal in reversed(ordered):
+            if pos != cursor:
+                items.append(padding_item(pos - cursor))
+
+            items.append(data_item(signal))
+            cursor = pos + signal.length
+
+        return items
+
     def create_big() -> tuple[str, int, list[str]]:
-        items: list[tuple[str, str, str | None]] = []
+        items: list[tuple[str, int, str | None]] = []
         start = 0
 
         # Select BE signals
@@ -235,6 +282,12 @@ def create_encode_decode_formats(signals: Sequence[Union["Data", "Signal"]], num
 
         # Ensure BE signals are sorted in network order
         sorted_signals = sorted(be_signals, key = lambda signal: sawtooth_to_network_bitnum(signal.start))
+
+        overlapping = create_overlapping([(start_bit(signal), signal)
+                                          for signal in sorted_signals])
+
+        if overlapping is not None:
+            return fmt(overlapping), padding_mask(overlapping), names(overlapping)
 
         for signal in sorted_signals:
 
@@ -253,29 +306,36 @@ def create_encode_decode_formats(signals: Sequence[Union["Data", "Signal"]], num
         return fmt(items), padding_mask(items), names(items)
 
     def create_little() -> tuple[str, int, list[str]]:
-        items: list[tuple[str, str, str | None]] = []
+        items: list[tuple[str, int, str | None]] = []
         end = format_length
 
-        for signal in signals[::-1]:
-            if signal.byte_order == 'big_endian':
-                continue
+        le_signals = [signal for signal in signals[::-1]
+                      if signal.byte_order != 'big_endian']
 
-            padding_length = end - (signal.start + signal.length)
+        # little endian data is unpacked from the reversed buffer
+        items_overlapping = create_overlapping(
+            [(format_length - (signal.start + signal.length), signal)
+             for signal in le_signals])
 
-            if padding_length > 0:
-                items.append(padding_item(padding_length))
+        if items_overlapping is not None:
+            items = items_overlapping
+        else:
+            for signal in le_signals:
+                padding_length = end - (signal.start + signal.length)
 
-            items.append(data_item(signal))
-            end = signal.start
+                if padding_length > 0:
+                    items.append(padding_item(padding_length))
 
-        if end > 0:
-            items.append(padding_item(end))
+                items.append(data_item(signal))
+                end = signal.start
+
+            if end > 0:
+                items.append(padding_item(end))
 
         value = padding_mask(items)
 
         if format_length > 0:
-            length = len(''.join([item[1] for item in items]))
-            _packed = bitstruct.pack(f'u{length}', value)
+            _packed = bitstruct.pack(f'u{format_length}', value)
             value = int.from_bytes(_packed, "little")
 
         return fmt(items), value, names(items)
